@@ -503,6 +503,7 @@ def step_result():
         deal_names=deal_names,
     )
 
+    # -------- Основной рейтинг --------
     st.subheader("Рейтинг")
     for rank, i in enumerate(res.order, start=1):
         st.markdown(
@@ -524,6 +525,180 @@ def step_result():
     chart = {res.deal_names[i]: float(res.V[i]) for i in res.order}
     st.bar_chart(chart)
 
+    # -------- Анализ надёжности --------
+    st.divider()
+    st.subheader("Насколько можно доверять этому рейтингу?")
+
+    st.write(
+        "Рейтинг зависит от твоего отношения к риску (λ). "
+        "Мы проверили, что произойдёт, если менять этот настрой от 0 "
+        "(только возможности) до 1 (только риски)."
+    )
+
+    def lam_zone(lam):
+        if lam < 0.15:
+            return "только возможности"
+        if lam < 0.4:
+            return "склонен к возможностям"
+        if lam < 0.6:
+            return "сбалансирован"
+        if lam < 0.85:
+            return "склонен к осторожности"
+        return "только риски"
+
+    lambdas = [round(x * 0.05, 2) for x in range(21)]
+    V_by_lam = {name: [] for name in deal_names}
+    leader_by_lam = []
+    margin_by_lam = []
+
+    for lam in lambdas:
+        r = m.rank(
+            st.session_state.P_risk,
+            st.session_state.P_opp,
+            lam=lam,
+            deal_names=deal_names,
+        )
+        for i, name in enumerate(deal_names):
+            V_by_lam[name].append(float(r.V[i]))
+        leader_by_lam.append(r.ranked_deals()[0])
+        sorted_v = sorted(r.V, reverse=True)
+        margin = float(sorted_v[0] - sorted_v[1]) if len(sorted_v) > 1 else 0.0
+        margin_by_lam.append(margin)
+
+    current_lam = st.session_state.lam
+    closest_lam = min(lambdas, key=lambda x: abs(x - current_lam))
+    current_idx = lambdas.index(closest_lam)
+    current_leader = leader_by_lam[current_idx]
+    current_margin = margin_by_lam[current_idx]
+
+    n_switches = sum(
+        1 for j in range(1, len(leader_by_lam))
+        if leader_by_lam[j] != leader_by_lam[j - 1]
+    )
+
+    def steps_to_switch(idx):
+        """Сколько шагов сетки (по 0.05) до ближайшей смены лидера. None — смены нет."""
+        for d in range(1, len(leader_by_lam)):
+            if idx - d >= 0 and leader_by_lam[idx - d] != leader_by_lam[idx]:
+                return d
+            if idx + d < len(leader_by_lam) and leader_by_lam[idx + d] != leader_by_lam[idx]:
+                return d
+        return None
+
+    steps = steps_to_switch(current_idx)
+
+    # -------- Вердикт --------
+    if n_switches == 0:
+        if current_margin >= 0.10:
+            st.success(
+                f"✅ **Надёжное решение.** При любом отношении к риску "
+                f"лидирует **{current_leader}**. Отрыв от второго места — "
+                f"{current_margin:.2f} балла. Это значит, что одно дело "
+                f"действительно важнее остальных по всем параметрам сразу."
+            )
+        else:
+            st.warning(
+                f"⚠️ **Умеренно устойчивое.** Лидер один и тот же при "
+                f"любом λ — **{current_leader}**, но отрыв от второго "
+                f"места всего {current_margin:.2f} балла. Формально "
+                f"порядок не меняется, но дела почти равнозначны — "
+                f"стоит перепроверить оценки."
+            )
+    else:
+        if steps is not None and steps == 1:
+            st.error(
+                f"❗ **Решение на грани.** Ты сейчас в точке λ = "
+                f"{current_lam:.2f} («{lam_zone(current_lam)}»), и всего "
+                f"один шаг до смены лидера. Это значит, что малейшее "
+                f"изменение отношения к риску перевернёт рейтинг. "
+                f"Стоит ещё раз подумать над оценками."
+            )
+        elif steps is not None and steps <= 3:
+            st.warning(
+                f"⚠️ **Умеренно устойчивое.** Ты в точке λ = "
+                f"{current_lam:.2f} («{lam_zone(current_lam)}»), лидирует "
+                f"**{current_leader}**. До точки, где порядок меняется, "
+                f"{steps} шага по шкале. Сейчас решение держится, "
+                f"но оно не «каменное» — при заметном сдвиге настроя "
+                f"рейтинг может измениться."
+            )
+        else:
+            st.success(
+                f"✅ **Надёжное для твоего настроя.** При λ = "
+                f"{current_lam:.2f} («{lam_zone(current_lam)}») лидирует "
+                f"**{current_leader}** с отрывом {current_margin:.2f}. "
+                f"Ближайшая смена лидера — далеко, так что для твоего "
+                f"отношения к риску вывод однозначен."
+            )
+
+    # -------- Кто лидирует при каких λ --------
+    st.write("**Кто выходит в лидеры при разных отношениях к риску:**")
+
+    ranges = []
+    current_l = leader_by_lam[0]
+    start_lam = lambdas[0]
+    prev_lam = lambdas[0]
+    for lam, leader in zip(lambdas[1:], leader_by_lam[1:]):
+        if leader != current_l:
+            ranges.append((current_l, start_lam, prev_lam))
+            current_l = leader
+            start_lam = lam
+        prev_lam = lam
+    ranges.append((current_l, start_lam, lambdas[-1]))
+
+    for leader, lo, hi in ranges:
+        if lo == hi:
+            st.write(f"- **{leader}** — при λ = {lo:.2f}")
+        elif hi - lo < 0.05:
+            st.write(f"- **{leader}** — узкая зона вокруг λ = {lo:.2f}")
+        else:
+            st.write(
+                f"- **{leader}** — от «{lam_zone(lo)}» до «{lam_zone(hi)}» "
+                f"(λ от {lo:.2f} до {hi:.2f})"
+            )
+
+    if n_switches == 0:
+        st.info(
+            "💡 **Почему лидер не меняется.** Похоже, одно дело "
+            "доминирует: у него и риски выше, и возможности выше "
+            "остальных. Чтобы увидеть, где решение на самом деле "
+            "«шатается», попробуй сделать так, чтобы у одного дела "
+            "были высокие риски и низкие возможности, а у другого — "
+            "наоборот."
+        )
+
+    # -------- Диагностика --------
+    with st.expander("🔍 Диагностика вердикта", expanded=False):
+        st.write(f"**Текущая λ:** {current_lam:.2f} (сетка: {closest_lam:.2f})")
+        st.write(f"**Лидер при текущей λ:** {current_leader}")
+        st.write(f"**Отрыв от второго места:** {current_margin:.3f}")
+        st.write(f"**Число смен лидера:** {n_switches}")
+        if steps is not None:
+            st.write(
+                f"**Шагов до ближайшей смены лидера:** {steps} "
+                f"(это λ = {lambdas[current_idx + steps] if current_idx + steps < len(lambdas) and leader_by_lam[current_idx + steps] != current_leader else lambdas[current_idx - steps]:.2f})"
+            )
+        else:
+            st.write("**Шагов до смены лидера:** смены нет на всей шкале")
+        st.caption(
+            "Пороги: ❗ на грани — 1 шаг до смены; "
+            "⚠️ умеренно устойчивое — 2–3 шага или маленький отрыв при отсутствии смен; "
+            "✅ надёжное — 4+ шагов или отрыв ≥ 0.10."
+        )
+
+    # -------- График --------
+    st.write("**Как меняется балл каждого дела в зависимости от настроя:**")
+    st.caption(
+        "Чем выше линия — тем важнее дело при данном λ. "
+        "Точки пересечения — моменты, когда порядок дел меняется."
+    )
+
+    line_data = {"λ": lambdas}
+    for name in deal_names:
+        line_data[name] = V_by_lam[name]
+    st.line_chart(line_data, x="λ")
+
+    # -------- Навигация --------
     st.divider()
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -534,7 +709,6 @@ def step_result():
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
-
 
 # ============ Роутер ============
 steps = [
