@@ -1,7 +1,12 @@
 """RASP — Streamlit app v7."""
 import uuid
-import streamlit as st
+import json
+from datetime import datetime
+
 import numpy as np
+import pandas as pd
+import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 
 from rasp_core import RASPMethod
 
@@ -14,11 +19,14 @@ def uid():
 
 
 def init_state():
+    """Инициализация всех необходимых ключей в session_state."""
     defaults = {
         "step": 0,
+        "consent_given": False,
         "deals": [],
         "risk_factors": [],
         "opp_factors": [],
+        # ... (остальные ключи, как у вас было) ...
         "deals_store": {},
         "risk_store": {},
         "opp_store": {},
@@ -28,17 +36,58 @@ def init_state():
         "P_risk": None,
         "P_opp": None,
         "lam": 0.5,
-        "_init_deals": False,
-        "_init_rf": False,
-        "_init_of": False,
+        "final_result": None,
+        "app_rating": None,
+        "app_comment": "",
+        "session_id": str(uuid.uuid4()),
+        "start_time": datetime.now().isoformat(),
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
-
 init_state()
 
+# --- Экран согласия ---
+if not st.session_state.consent_given:
+    st.title("Добро пожаловать в RASP")
+    st.markdown("""
+    ### Перед началом работы, пожалуйста, ознакомьтесь с условиями
+
+    **RASP** — это исследовательский проект, направленный на создание удобного инструмента для расстановки приоритетов.
+
+    Для улучшения приложения мы собираем **обезличенную статистику**:
+    *   **Какие данные собираются:**
+        *   Ваши действия в интерфейсе (нажатия кнопок, перемещение по шагам).
+        *   Список ваших дел, факторов и оценок (в обезличенном виде).
+        *   Ваш отзыв об приложении (оценка и комментарий).
+    *   **С какой целью:**
+        *   Понять, какие функции наиболее востребованы и удобны.
+        *   Выявить «узкие места» в интерфейсе.
+        *   Собрать предложения по улучшению.
+
+    **Ваши данные обезличены.** Вместо имени и других личных данных используется случайный идентификатор. Мы **не собираем** имена, email, номера телефонов или другие персональные сведения.
+
+    Нажимая «Согласен, продолжить», вы даёте согласие на сбор и обработку обезличенных данных в исследовательских целях.
+    """)
+
+    consent = st.checkbox("Я согласен на сбор обезличенных данных и хочу продолжить")
+
+    if consent:
+        st.session_state.consent_given = True
+        st.rerun()
+    st.stop()  # Блокируем дальнейший код, пока согласие не дано
+import streamlit_analytics2 as streamlit_analytics
+
+# ... (после блока согласия) ...
+
+with streamlit_analytics.track(session_id=st.session_state.session_id):
+    # Здесь идёт вся остальная логика вашего приложения:
+    # роутинг по шагам, отрисовка интерфейса и т.д.
+    # Например:
+    progress = st.session_state.step / (len(steps) - 1)
+    st.progress(progress)
+    steps[st.session_state.step]()
 
 def next_step():
     st.session_state.step += 1
@@ -214,7 +263,28 @@ def probability_label(p):
 
 # ============ Шаги ============
 def step_deals():
-    st.header("Шаг 1. Список дел")
+    st.header("Добро пожаловать в RASP")
+
+    st.markdown(
+        """
+**RASP — уникальная методика определения собственных приоритетов.**
+
+Данная версия приложения работает только для ситуаций, в которых **нельзя отказаться от дела**. 
+К сожалению, если ты хочешь решить, от какого дела отказаться в жизни — данная версия в этом не поможет. 
+Но если тебе просто хочется понять, с какой задачи стоит начать деятельность — это приложение для тебя.
+
+Алгоритм **не поможет тебе снизить деловую нагрузку** — он поможет только упорядочить твои задачи.
+
+RASP пока применим только для **краткосрочного** использования, но в будущем он станет лучше 
+и научится помогать расставлять приоритеты в долгосрочной перспективе и даже помогать принимать 
+решения в системе **«выбор-отказ»**. Сейчас ты можешь протестировать это приложение 
+и поделиться своими впечатлениями от использования.
+        """
+    )
+
+    st.divider()
+
+    st.subheader("Шаг 1. Список дел")
     st.write("Добавь дела, между которыми нужно расставить приоритеты.")
 
     if not st.session_state._init_deals:
@@ -709,7 +779,85 @@ def step_result():
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
+# ... (после блока с анализом устойчивости по λ) ...
 
+st.divider()
+st.subheader("Поделитесь вашим мнением")
+
+# Виджет оценки (звёзды)
+rating = st.feedback("stars", key="app_rating")
+if rating is not None:
+    st.session_state.app_rating = rating
+
+# Поле для комментария
+comment = st.text_area(
+    "Что можно улучшить? (необязательно)",
+    value=st.session_state.app_comment,
+    key="app_comment_widget"
+)
+
+# Кнопка отправки отзыва
+if st.button("Отправить отзыв", key="submit_feedback"):
+    if st.session_state.app_rating is None and not comment.strip():
+        st.warning("Пожалуйста, поставьте оценку или напишите комментарий.")
+    else:
+        # Сохраняем в Google Sheets
+        try:
+            conn = st.connection("gsheets", type=GSheetsConnection)
+            existing_data = conn.read(worksheet="feedback", ttl=0)
+            
+            new_feedback = pd.DataFrame([{
+                "timestamp": datetime.now().isoformat(),
+                "session_id": st.session_state.session_id,
+                "rating": st.session_state.app_rating + 1 if st.session_state.app_rating is not None else None,
+                "comment": comment,
+            }])
+            
+            updated_df = pd.concat([existing_data, new_feedback], ignore_index=True)
+            conn.update(worksheet="feedback", data=updated_df)
+            st.success("Спасибо! Ваш отзыв отправлен.")
+        except Exception as e:
+            st.error(f"Не удалось отправить отзыв: {e}")
+
+# ... (далее идут кнопки навигации) ...
+# ... (после блока с отзывом) ...
+
+st.divider()
+
+if st.button("Завершить и сохранить сессию", key="save_session"):
+    session_data = {
+        "session_id": st.session_state.session_id,
+        "start_time": st.session_state.start_time,
+        "end_time": datetime.now().isoformat(),
+        "deals": list(st.session_state.deals_store.values()),
+        "risk_factors": list(st.session_state.risk_store.values()),
+        "opp_factors": list(st.session_state.opp_store.values()),
+        "risk_priorities": st.session_state.risk_priorities,
+        "opp_priorities": st.session_state.opp_priorities,
+        "lambda": st.session_state.lam,
+        "final_ranking": st.session_state.final_result, # Это нужно будет сохранить на шаге 8
+        "app_rating": st.session_state.app_rating,
+        "app_comment": st.session_state.app_comment,
+    }
+    
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        existing_sessions = conn.read(worksheet="sessions", ttl=0)
+        
+        # Преобразуем сложные структуры в JSON-строки для хранения
+        session_data_json = json.dumps(session_data, ensure_ascii=False, indent=2)
+        
+        new_session = pd.DataFrame([{
+            "timestamp": datetime.now().isoformat(),
+            "session_id": st.session_state.session_id,
+            "data": session_data_json,
+        }])
+        
+        updated_sessions_df = pd.concat([existing_sessions, new_session], ignore_index=True)
+        conn.update(worksheet="sessions", data=updated_sessions_df)
+        st.success("Сессия сохранена. Спасибо за участие!")
+    except Exception as e:
+        st.error(f"Не удалось сохранить сессию: {e}")
 # ============ Роутер ============
 steps = [
     step_deals,
