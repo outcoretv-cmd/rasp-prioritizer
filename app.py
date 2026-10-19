@@ -1,4 +1,4 @@
-"""RASP — Streamlit app v7."""
+"""RASP — Streamlit app v8: consent + analytics + feedback + safety."""
 import uuid
 import json
 from datetime import datetime
@@ -6,10 +6,38 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
 
 from rasp_core import RASPMethod
 
+# ============ ОПЦИОНАЛЬНЫЕ ИМПОРТЫ ============
+try:
+    import streamlit_analytics2 as streamlit_analytics
+    HAS_ANALYTICS = True
+except ImportError:
+    HAS_ANALYTICS = False
+
+try:
+    from streamlit_gsheets import GSheetsConnection
+    HAS_GSHEETS = True
+except ImportError:
+    HAS_GSHEETS = False
+
+
+def sheets_available():
+    """Google Sheets доступен только если есть пакет и настроены секреты."""
+    if not HAS_GSHEETS:
+        return False
+    try:
+        return (
+            "connections" in st.secrets
+            and "gsheets" in st.secrets["connections"]
+        )
+    except Exception:
+        return False
+
+
+# ============ КОНСТАНТЫ ============
+APP_VERSION = "v8"
 st.set_page_config(page_title="RASP", layout="centered")
 st.title("RASP")
 
@@ -18,15 +46,50 @@ def uid():
     return uuid.uuid4().hex[:8]
 
 
+def probability_label(p):
+    if p == 0:
+        return "🔴 Я уверен, что нет"
+    if p < 25:
+        return "🟠 Скорее нет, чем да"
+    if p < 50:
+        return "🟡 Нет, но я не уверен в этом"
+    if p == 50:
+        return "⚪ Может да, а может нет"
+    if p <= 75:
+        return "🟡 Да, но я не уверен в этом"
+    if p < 100:
+        return "🟢 Скорее да, чем нет"
+    return "🟢 Я уверен, что да"
+
+
+def lam_zone(lam):
+    if lam < 0.15:
+        return "только возможности"
+    if lam < 0.4:
+        return "склонен к возможностям"
+    if lam < 0.6:
+        return "сбалансирован"
+    if lam < 0.85:
+        return "склонен к осторожности"
+    return "только риски"
+
+
+# ============ ИНИЦИАЛИЗАЦИЯ ============
 def init_state():
-    """Инициализация всех необходимых ключей в session_state."""
+    old_version = st.session_state.get("_app_version")
+    old_consent = st.session_state.get("consent_given", False)
+
+    if old_version != APP_VERSION:
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+
     defaults = {
+        "_app_version": APP_VERSION,
+        "consent_given": old_consent,
         "step": 0,
-        "consent_given": False,
         "deals": [],
         "risk_factors": [],
         "opp_factors": [],
-        # ... (остальные ключи, как у вас было) ...
         "deals_store": {},
         "risk_store": {},
         "opp_store": {},
@@ -41,53 +104,17 @@ def init_state():
         "app_comment": "",
         "session_id": str(uuid.uuid4()),
         "start_time": datetime.now().isoformat(),
+        "_init_deals": False,
+        "_init_rf": False,
+        "_init_of": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
+
 init_state()
 
-# --- Экран согласия ---
-if not st.session_state.consent_given:
-    st.title("Добро пожаловать в RASP")
-    st.markdown("""
-    ### Перед началом работы, пожалуйста, ознакомьтесь с условиями
-
-    **RASP** — это исследовательский проект, направленный на создание удобного инструмента для расстановки приоритетов.
-
-    Для улучшения приложения мы собираем **обезличенную статистику**:
-    *   **Какие данные собираются:**
-        *   Ваши действия в интерфейсе (нажатия кнопок, перемещение по шагам).
-        *   Список ваших дел, факторов и оценок (в обезличенном виде).
-        *   Ваш отзыв об приложении (оценка и комментарий).
-    *   **С какой целью:**
-        *   Понять, какие функции наиболее востребованы и удобны.
-        *   Выявить «узкие места» в интерфейсе.
-        *   Собрать предложения по улучшению.
-
-    **Ваши данные обезличены.** Вместо имени и других личных данных используется случайный идентификатор. Мы **не собираем** имена, email, номера телефонов или другие персональные сведения.
-
-    Нажимая «Согласен, продолжить», вы даёте согласие на сбор и обработку обезличенных данных в исследовательских целях.
-    """)
-
-    consent = st.checkbox("Я согласен на сбор обезличенных данных и хочу продолжить")
-
-    if consent:
-        st.session_state.consent_given = True
-        st.rerun()
-    st.stop()  # Блокируем дальнейший код, пока согласие не дано
-import streamlit_analytics2 as streamlit_analytics
-
-# ... (после блока согласия) ...
-
-with streamlit_analytics.track(session_id=st.session_state.session_id):
-    # Здесь идёт вся остальная логика вашего приложения:
-    # роутинг по шагам, отрисовка интерфейса и т.д.
-    # Например:
-    progress = st.session_state.step / (len(steps) - 1)
-    st.progress(progress)
-    steps[st.session_state.step]()
 
 def next_step():
     st.session_state.step += 1
@@ -99,7 +126,61 @@ def prev_step():
     st.rerun()
 
 
-# ============ Динамические ячейки ============
+# ============ ЭКРАН СОГЛАСИЯ ============
+def render_consent():
+    st.header("Добро пожаловать в RASP")
+    st.markdown(
+        """
+**RASP — уникальная методика определения собственных приоритетов.**
+
+Данная версия приложения работает только для ситуаций, в которых **нельзя отказаться от дела**.
+Если ты хочешь решить, от какого дела отказаться в жизни — эта версия в этом не поможет.
+Но если тебе просто хочется понять, с какой задачи стоит начать — это приложение для тебя.
+
+Алгоритм **не поможет снизить деловую нагрузку** — он поможет только упорядочить задачи.
+
+RASP пока применим только для **краткосрочного** использования, но в будущем станет лучше
+и научится помогать расставлять приоритеты в долгосрочной перспективе и даже принимать
+решения в системе **«выбор-отказ»**.
+        """
+    )
+
+    st.divider()
+    st.subheader("Перед началом работы")
+
+    st.markdown(
+        """
+Для улучшения приложения мы собираем **обезличенную статистику**.
+
+**Что собирается:**
+- Твои действия в интерфейсе (нажатия кнопок, перемещение по шагам);
+- Список твоих дел, факторов и оценок — **в обезличенном виде**;
+- Твой отзыв об приложении (оценка и комментарий).
+
+**С какой целью:**
+- Понять, какие функции наиболее востребованы и удобны;
+- Выявить «узкие места» в интерфейсе;
+- Собрать предложения по улучшению.
+
+**Твои данные обезличены.** Вместо имени и других личных данных используется
+случайный идентификатор. Мы **не собираем** имена, e-mail, номера телефонов
+или другие персональные сведения.
+
+Нажимая «Согласен, продолжить», ты даёшь согласие на сбор и обработку
+обезличенных данных в исследовательских целях.
+        """
+    )
+
+    consent = st.checkbox(
+        "Я согласен на сбор обезличенных данных и хочу продолжить",
+        key="consent_checkbox",
+    )
+    if consent:
+        st.session_state.consent_given = True
+        st.rerun()
+
+
+# ============ ДИНАМИЧЕСКИЕ ЯЧЕЙКИ ============
 def render_cell_list(items_key, store_key, placeholder):
     items = st.session_state[items_key]
     store = st.session_state[store_key]
@@ -149,7 +230,7 @@ def collect_items(items_key, store_key):
     return result
 
 
-# ============ Связанные ползунки ============
+# ============ СВЯЗАННЫЕ ПОЛЗУНКИ ============
 def render_linked_priorities(items, values_key, prefix):
     if not items:
         return
@@ -245,45 +326,8 @@ def priorities_to_rasp(items, priorities):
     return [name for _, name in sorted_items], q
 
 
-def probability_label(p):
-    if p == 0:
-        return "🔴 Я уверен, что нет"
-    if p < 25:
-        return "🟠 Скорее нет, чем да"
-    if p < 50:
-        return "🟡 Нет, но я не уверен в этом"
-    if p == 50:
-        return "⚪ Может да, а может нет"
-    if p <= 75:
-        return "🟡 Да, но я не уверен в этом"
-    if p < 100:
-        return "🟢 Скорее да, чем нет"
-    return "🟢 Я уверен, что да"
-
-
-# ============ Шаги ============
+# ============ ШАГИ ============
 def step_deals():
-    st.header("Добро пожаловать в RASP")
-
-    st.markdown(
-        """
-**RASP — уникальная методика определения собственных приоритетов.**
-
-Данная версия приложения работает только для ситуаций, в которых **нельзя отказаться от дела**. 
-К сожалению, если ты хочешь решить, от какого дела отказаться в жизни — данная версия в этом не поможет. 
-Но если тебе просто хочется понять, с какой задачи стоит начать деятельность — это приложение для тебя.
-
-Алгоритм **не поможет тебе снизить деловую нагрузку** — он поможет только упорядочить твои задачи.
-
-RASP пока применим только для **краткосрочного** использования, но в будущем он станет лучше 
-и научится помогать расставлять приоритеты в долгосрочной перспективе и даже помогать принимать 
-решения в системе **«выбор-отказ»**. Сейчас ты можешь протестировать это приложение 
-и поделиться своими впечатлениями от использования.
-        """
-    )
-
-    st.divider()
-
     st.subheader("Шаг 1. Список дел")
     st.write("Добавь дела, между которыми нужно расставить приоритеты.")
 
@@ -336,8 +380,7 @@ def step_opp():
     st.header("Шаг 3. Факторы возможностей")
     st.write(
         "Возможности — это выгода, которую ты хочешь получить. "
-        "Перечисли бонусы, которые ты получишь, "
-        "если **сделаешь** свои дела."
+        "Перечисли бонусы, которые ты получишь, если **сделаешь** свои дела."
     )
 
     if not st.session_state._init_of:
@@ -365,11 +408,10 @@ def step_risk_priority():
     st.header("Шаг 4. Приоритет рисков")
     st.write(
         "Двигай ползунки, чтобы их расположение соответствовало "
-        "твоим представлениям о важности факторов риска. Обрати внимание, "
-        "что ползунки **взаимосвязаны**: на одном месте не могут быть "
-        "2 фактора риска — придётся выбирать, какой важнее. "
-        "Самый важный фактор имеет самое большое значение по шкале, "
-        "а самый маловажный — самое низкое."
+        "твоим представлениям о важности факторов риска. Ползунки "
+        "**взаимосвязаны**: на одном месте не могут быть 2 фактора — "
+        "придётся выбирать, какой важнее. Самый важный фактор имеет "
+        "самое большое значение, наименее важный — самое низкое."
     )
 
     items = collect_items("risk_factors", "risk_store")
@@ -396,10 +438,8 @@ def step_opp_priority():
     st.write(
         "Двигай ползунки, чтобы их расположение соответствовало "
         "твоим представлениям о важности факторов возможностей. "
-        "Обрати внимание, что ползунки **взаимосвязаны**: на одном "
-        "месте не могут быть 2 фактора возможностей — придётся выбирать, "
-        "какой важнее. Самый важный фактор имеет самое большое значение "
-        "по шкале, а самый маловажный — самое низкое."
+        "Ползунки **взаимосвязаны**: на одном месте не могут быть "
+        "2 фактора — придётся выбирать, какой важнее."
     )
 
     items = collect_items("opp_factors", "opp_store")
@@ -533,16 +573,7 @@ def step_lambda():
         )
 
     st.session_state.lam = lam
-
-    labels = {
-        0.0: "Только возможности",
-        0.25: "Склонен к возможностям",
-        0.5: "Сбалансирован",
-        0.75: "Склонен к осторожности",
-        1.0: "Только риски",
-    }
-    closest = min(labels, key=lambda k: abs(k - lam))
-    st.info(f"λ = {lam:.2f} — {labels[closest]}")
+    st.info(f"λ = {lam:.2f} — {lam_zone(lam)}")
 
     st.divider()
     c1, c2 = st.columns([1, 1])
@@ -573,6 +604,12 @@ def step_result():
         deal_names=deal_names,
     )
 
+    # Сохраняем финальный рейтинг для отчёта
+    st.session_state.final_result = [
+        {"rank": r + 1, "deal": res.deal_names[i], "V": float(res.V[i])}
+        for r, i in enumerate(res.order)
+    ]
+
     # -------- Основной рейтинг --------
     st.subheader("Рейтинг")
     for rank, i in enumerate(res.order, start=1):
@@ -595,26 +632,14 @@ def step_result():
     chart = {res.deal_names[i]: float(res.V[i]) for i in res.order}
     st.bar_chart(chart)
 
-    # -------- Анализ надёжности --------
+    # -------- Устойчивость --------
     st.divider()
     st.subheader("Насколько можно доверять этому рейтингу?")
-
     st.write(
         "Рейтинг зависит от твоего отношения к риску (λ). "
         "Мы проверили, что произойдёт, если менять этот настрой от 0 "
         "(только возможности) до 1 (только риски)."
     )
-
-    def lam_zone(lam):
-        if lam < 0.15:
-            return "только возможности"
-        if lam < 0.4:
-            return "склонен к возможностям"
-        if lam < 0.6:
-            return "сбалансирован"
-        if lam < 0.85:
-            return "склонен к осторожности"
-        return "только риски"
 
     lambdas = [round(x * 0.05, 2) for x in range(21)]
     V_by_lam = {name: [] for name in deal_names}
@@ -647,7 +672,6 @@ def step_result():
     )
 
     def steps_to_switch(idx):
-        """Сколько шагов сетки (по 0.05) до ближайшей смены лидера. None — смены нет."""
         for d in range(1, len(leader_by_lam)):
             if idx - d >= 0 and leader_by_lam[idx - d] != leader_by_lam[idx]:
                 return d
@@ -657,53 +681,40 @@ def step_result():
 
     steps = steps_to_switch(current_idx)
 
-    # -------- Вердикт --------
     if n_switches == 0:
         if current_margin >= 0.10:
             st.success(
                 f"✅ **Надёжное решение.** При любом отношении к риску "
-                f"лидирует **{current_leader}**. Отрыв от второго места — "
-                f"{current_margin:.2f} балла. Это значит, что одно дело "
-                f"действительно важнее остальных по всем параметрам сразу."
+                f"лидирует **{current_leader}**. Отрыв — "
+                f"{current_margin:.2f} балла."
             )
         else:
             st.warning(
-                f"⚠️ **Умеренно устойчивое.** Лидер один и тот же при "
-                f"любом λ — **{current_leader}**, но отрыв от второго "
-                f"места всего {current_margin:.2f} балла. Формально "
-                f"порядок не меняется, но дела почти равнозначны — "
-                f"стоит перепроверить оценки."
+                f"⚠️ **Умеренно устойчивое.** Лидер один и тот же — "
+                f"**{current_leader}**, но отрыв всего "
+                f"{current_margin:.2f} балла. Дела почти равнозначны."
             )
     else:
         if steps is not None and steps == 1:
             st.error(
-                f"❗ **Решение на грани.** Ты сейчас в точке λ = "
-                f"{current_lam:.2f} («{lam_zone(current_lam)}»), и всего "
-                f"один шаг до смены лидера. Это значит, что малейшее "
-                f"изменение отношения к риску перевернёт рейтинг. "
-                f"Стоит ещё раз подумать над оценками."
+                f"❗ **Решение на грани.** Ты в точке λ = {current_lam:.2f} "
+                f"(«{lam_zone(current_lam)}»), и всего один шаг до смены "
+                f"лидера. Малейшее изменение настроя перевернёт рейтинг."
             )
         elif steps is not None and steps <= 3:
             st.warning(
                 f"⚠️ **Умеренно устойчивое.** Ты в точке λ = "
                 f"{current_lam:.2f} («{lam_zone(current_lam)}»), лидирует "
-                f"**{current_leader}**. До точки, где порядок меняется, "
-                f"{steps} шага по шкале. Сейчас решение держится, "
-                f"но оно не «каменное» — при заметном сдвиге настроя "
-                f"рейтинг может измениться."
+                f"**{current_leader}**. До смены — {steps} шага."
             )
         else:
             st.success(
                 f"✅ **Надёжное для твоего настроя.** При λ = "
                 f"{current_lam:.2f} («{lam_zone(current_lam)}») лидирует "
-                f"**{current_leader}** с отрывом {current_margin:.2f}. "
-                f"Ближайшая смена лидера — далеко, так что для твоего "
-                f"отношения к риску вывод однозначен."
+                f"**{current_leader}** с отрывом {current_margin:.2f}."
             )
 
-    # -------- Кто лидирует при каких λ --------
-    st.write("**Кто выходит в лидеры при разных отношениях к риску:**")
-
+    st.write("**Кто выходит в лидеры при разных λ:**")
     ranges = []
     current_l = leader_by_lam[0]
     start_lam = lambdas[0]
@@ -719,54 +730,110 @@ def step_result():
     for leader, lo, hi in ranges:
         if lo == hi:
             st.write(f"- **{leader}** — при λ = {lo:.2f}")
-        elif hi - lo < 0.05:
-            st.write(f"- **{leader}** — узкая зона вокруг λ = {lo:.2f}")
         else:
             st.write(
-                f"- **{leader}** — от «{lam_zone(lo)}» до «{lam_zone(hi)}» "
-                f"(λ от {lo:.2f} до {hi:.2f})"
+                f"- **{leader}** — от «{lam_zone(lo)}» до "
+                f"«{lam_zone(hi)}» (λ от {lo:.2f} до {hi:.2f})"
             )
 
     if n_switches == 0:
         st.info(
-            "💡 **Почему лидер не меняется.** Похоже, одно дело "
-            "доминирует: у него и риски выше, и возможности выше "
-            "остальных. Чтобы увидеть, где решение на самом деле "
-            "«шатается», попробуй сделать так, чтобы у одного дела "
-            "были высокие риски и низкие возможности, а у другого — "
-            "наоборот."
+            "💡 **Почему лидер не меняется.** Одно дело доминирует: "
+            "у него и риски выше, и возможности выше остальных."
         )
 
-    # -------- Диагностика --------
     with st.expander("🔍 Диагностика вердикта", expanded=False):
-        st.write(f"**Текущая λ:** {current_lam:.2f} (сетка: {closest_lam:.2f})")
-        st.write(f"**Лидер при текущей λ:** {current_leader}")
+        st.write(f"**Текущая λ:** {current_lam:.2f}")
+        st.write(f"**Лидер:** {current_leader}")
         st.write(f"**Отрыв от второго места:** {current_margin:.3f}")
         st.write(f"**Число смен лидера:** {n_switches}")
-        if steps is not None:
-            st.write(
-                f"**Шагов до ближайшей смены лидера:** {steps} "
-                f"(это λ = {lambdas[current_idx + steps] if current_idx + steps < len(lambdas) and leader_by_lam[current_idx + steps] != current_leader else lambdas[current_idx - steps]:.2f})"
-            )
-        else:
-            st.write("**Шагов до смены лидера:** смены нет на всей шкале")
-        st.caption(
-            "Пороги: ❗ на грани — 1 шаг до смены; "
-            "⚠️ умеренно устойчивое — 2–3 шага или маленький отрыв при отсутствии смен; "
-            "✅ надёжное — 4+ шагов или отрыв ≥ 0.10."
-        )
+        st.write(f"**Шагов до смены:** {steps if steps is not None else '—'}")
 
-    # -------- График --------
-    st.write("**Как меняется балл каждого дела в зависимости от настроя:**")
-    st.caption(
-        "Чем выше линия — тем важнее дело при данном λ. "
-        "Точки пересечения — моменты, когда порядок дел меняется."
-    )
-
+    st.write("**Как меняется балл каждого дела:**")
+    st.caption("Точки пересечения линий — моменты смены лидера.")
     line_data = {"λ": lambdas}
     for name in deal_names:
         line_data[name] = V_by_lam[name]
     st.line_chart(line_data, x="λ")
+
+    # -------- Обратная связь --------
+    st.divider()
+    st.subheader("Поделитесь мнением")
+
+    rating = st.feedback("stars", key="app_rating_widget")
+    if rating is not None:
+        st.session_state.app_rating = rating
+
+    comment = st.text_area(
+        "Что можно улучшить? (необязательно)",
+        value=st.session_state.app_comment,
+        key="app_comment_widget",
+    )
+    st.session_state.app_comment = comment
+
+    if st.button("Отправить отзыв", key="submit_feedback"):
+        if st.session_state.app_rating is None and not comment.strip():
+            st.warning("Поставь оценку или напиши комментарий.")
+        elif not sheets_available():
+            st.info(
+                "Сбор отзывов временно недоступен (не настроены секреты). "
+                "Спасибо за прохождение!"
+            )
+        else:
+            try:
+                conn = st.connection("gsheets", type=GSheetsConnection)
+                existing = conn.read(worksheet="feedback", ttl=0)
+                new_row = pd.DataFrame([{
+                    "timestamp": datetime.now().isoformat(),
+                    "session_id": st.session_state.session_id,
+                    "rating": (
+                        st.session_state.app_rating + 1
+                        if st.session_state.app_rating is not None else None
+                    ),
+                    "comment": comment,
+                }])
+                updated = pd.concat([existing, new_row], ignore_index=True)
+                conn.update(worksheet="feedback", data=updated)
+                st.success("Спасибо! Отзыв отправлен.")
+            except Exception as e:
+                st.error(f"Не удалось отправить отзыв: {e}")
+
+    # -------- Сохранение сессии --------
+    if st.button("Завершить и сохранить сессию", key="save_session"):
+        session_data = {
+            "session_id": st.session_state.session_id,
+            "start_time": st.session_state.start_time,
+            "end_time": datetime.now().isoformat(),
+            "deals": list(st.session_state.deals_store.values()),
+            "risk_factors": list(st.session_state.risk_store.values()),
+            "opp_factors": list(st.session_state.opp_store.values()),
+            "risk_priorities": st.session_state.risk_priorities,
+            "opp_priorities": st.session_state.opp_priorities,
+            "lambda": st.session_state.lam,
+            "final_ranking": st.session_state.final_result,
+            "app_rating": st.session_state.app_rating,
+            "app_comment": st.session_state.app_comment,
+        }
+
+        if not sheets_available():
+            st.info(
+                "Сохранение сессий временно недоступно "
+                "(не настроены секреты). Спасибо за прохождение!"
+            )
+        else:
+            try:
+                conn = st.connection("gsheets", type=GSheetsConnection)
+                existing = conn.read(worksheet="sessions", ttl=0)
+                new_row = pd.DataFrame([{
+                    "timestamp": datetime.now().isoformat(),
+                    "session_id": st.session_state.session_id,
+                    "data": json.dumps(session_data, ensure_ascii=False),
+                }])
+                updated = pd.concat([existing, new_row], ignore_index=True)
+                conn.update(worksheet="sessions", data=updated)
+                st.success("Сессия сохранена. Спасибо за участие!")
+            except Exception as e:
+                st.error(f"Не удалось сохранить сессию: {e}")
 
     # -------- Навигация --------
     st.divider()
@@ -779,97 +846,39 @@ def step_result():
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
-# ... (после блока с анализом устойчивости по λ) ...
 
-st.divider()
-st.subheader("Поделитесь вашим мнением")
 
-# Виджет оценки (звёзды)
-rating = st.feedback("stars", key="app_rating")
-if rating is not None:
-    st.session_state.app_rating = rating
+# ============ РОУТЕР ============
+def render_main_app():
+    steps = [
+        step_deals,
+        step_risk,
+        step_opp,
+        step_risk_priority,
+        step_opp_priority,
+        step_probabilities,
+        step_lambda,
+        step_result,
+    ]
 
-# Поле для комментария
-comment = st.text_area(
-    "Что можно улучшить? (необязательно)",
-    value=st.session_state.app_comment,
-    key="app_comment_widget"
-)
+    progress = st.session_state.step / (len(steps) - 1)
+    st.progress(progress)
+    steps[st.session_state.step]()
 
-# Кнопка отправки отзыва
-if st.button("Отправить отзыв", key="submit_feedback"):
-    if st.session_state.app_rating is None and not comment.strip():
-        st.warning("Пожалуйста, поставьте оценку или напишите комментарий.")
-    else:
-        # Сохраняем в Google Sheets
-        try:
-            conn = st.connection("gsheets", type=GSheetsConnection)
-            existing_data = conn.read(worksheet="feedback", ttl=0)
-            
-            new_feedback = pd.DataFrame([{
-                "timestamp": datetime.now().isoformat(),
-                "session_id": st.session_state.session_id,
-                "rating": st.session_state.app_rating + 1 if st.session_state.app_rating is not None else None,
-                "comment": comment,
-            }])
-            
-            updated_df = pd.concat([existing_data, new_feedback], ignore_index=True)
-            conn.update(worksheet="feedback", data=updated_df)
-            st.success("Спасибо! Ваш отзыв отправлен.")
-        except Exception as e:
-            st.error(f"Не удалось отправить отзыв: {e}")
 
-# ... (далее идут кнопки навигации) ...
-# ... (после блока с отзывом) ...
+# ============ ТОЧКА ВХОДА ============
+if not st.session_state.consent_given:
+    render_consent()
+    st.stop()
 
-st.divider()
-
-if st.button("Завершить и сохранить сессию", key="save_session"):
-    session_data = {
-        "session_id": st.session_state.session_id,
-        "start_time": st.session_state.start_time,
-        "end_time": datetime.now().isoformat(),
-        "deals": list(st.session_state.deals_store.values()),
-        "risk_factors": list(st.session_state.risk_store.values()),
-        "opp_factors": list(st.session_state.opp_store.values()),
-        "risk_priorities": st.session_state.risk_priorities,
-        "opp_priorities": st.session_state.opp_priorities,
-        "lambda": st.session_state.lam,
-        "final_ranking": st.session_state.final_result, # Это нужно будет сохранить на шаге 8
-        "app_rating": st.session_state.app_rating,
-        "app_comment": st.session_state.app_comment,
-    }
-    
+# Аналитика — опциональна, при ошибке продолжит без неё
+if HAS_ANALYTICS:
     try:
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        existing_sessions = conn.read(worksheet="sessions", ttl=0)
-        
-        # Преобразуем сложные структуры в JSON-строки для хранения
-        session_data_json = json.dumps(session_data, ensure_ascii=False, indent=2)
-        
-        new_session = pd.DataFrame([{
-            "timestamp": datetime.now().isoformat(),
-            "session_id": st.session_state.session_id,
-            "data": session_data_json,
-        }])
-        
-        updated_sessions_df = pd.concat([existing_sessions, new_session], ignore_index=True)
-        conn.update(worksheet="sessions", data=updated_sessions_df)
-        st.success("Сессия сохранена. Спасибо за участие!")
-    except Exception as e:
-        st.error(f"Не удалось сохранить сессию: {e}")
-# ============ Роутер ============
-steps = [
-    step_deals,
-    step_risk,
-    step_opp,
-    step_risk_priority,
-    step_opp_priority,
-    step_probabilities,
-    step_lambda,
-    step_result,
-]
-
-progress = st.session_state.step / (len(steps) - 1)
-st.progress(progress)
-steps[st.session_state.step]()
+        with streamlit_analytics.track(
+            session_id=st.session_state.session_id,
+        ):
+            render_main_app()
+    except Exception:
+        render_main_app()
+else:
+    render_main_app()
